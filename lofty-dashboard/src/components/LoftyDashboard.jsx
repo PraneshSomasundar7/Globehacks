@@ -119,6 +119,62 @@ export default function LoftyDashboard() {
     return () => { cancelled = true }
   }, [agentEmail])
 
+  // ── Populate live feed with existing lead activity on mount ──────────────
+  useEffect(() => {
+    if (!agentEmail) return
+    let cancelled = false
+
+    async function fetchInitialActivity() {
+      const { data: leads } = await insforge.database
+        .from('leads')
+        .select('id, name, email, property_title, view_count, lead_score, last_activity')
+        .eq('agent_email', agentEmail)
+        .order('last_activity', { ascending: false })
+        .limit(MAX_FEED)
+
+      if (cancelled || !leads?.length) return
+
+      const activities = leads.map(l => ({
+        id:             `init-${l.id}`,
+        name:           l.name           || 'Unknown User',
+        propertyTitle:  l.property_title || 'Unknown Property',
+        viewCount:      l.view_count     || 0,
+        leadScore:      l.lead_score     || 0,
+        isHighInterest: (l.view_count || 0) >= 3 || (l.lead_score || 0) >= 70,
+        time:           l.last_activity ? new Date(l.last_activity) : new Date(),
+      }))
+
+      if (!cancelled) setLiveActivities(activities)
+
+      // Auto-surface AOS alert for the most recent high-interest lead
+      const topLead = leads.find(l => (l.view_count || 0) >= 3 || (l.lead_score || 0) >= 70)
+      if (topLead && !dismissedLeadsRef.current.has(`init-${topLead.id}`)) {
+        const alertId = `init-${topLead.id}`
+        setLiveAlert({
+          leadId:        alertId,
+          leadName:      topLead.name           || 'Unknown User',
+          leadEmail:     topLead.email          || '',
+          propertyTitle: topLead.property_title || 'Unknown Property',
+          leadScore:     topLead.lead_score     || 0,
+          viewCount:     topLead.view_count     || 0,
+          aiMessage:     null,
+        })
+        const aiMsg = await generateAIMessage({
+          leadName:      topLead.name           || 'Unknown User',
+          propertyTitle: topLead.property_title || 'Unknown Property',
+          agentFirstName,
+          viewCount:     topLead.view_count     || 0,
+        })
+        if (!cancelled) {
+          setLiveAlert(prev => prev?.leadId === alertId ? { ...prev, aiMessage: aiMsg } : prev)
+        }
+      }
+    }
+
+    fetchInitialActivity()
+    return () => { cancelled = true }
+  }, [agentEmail, agentFirstName]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Real-time subscription ─────────────────────────────────────────────────
   useEffect(() => {
     if (!agentEmail) return
@@ -129,7 +185,7 @@ export default function LoftyDashboard() {
         await insforge.realtime.connect()
         await insforge.realtime.subscribe('leads')
 
-        insforge.realtime.on('UPDATE_lead', async (payload) => {
+        const handleLeadEvent = async (payload) => {
           if (!active) return
 
           // Only process events that belong to THIS agent
@@ -146,16 +202,19 @@ export default function LoftyDashboard() {
 
           const isHighInterest = view_count >= 3 || lead_score >= 70
 
-          // Add to live feed immediately
-          setLiveActivities(prev => [{
-            id:            `${id}-${Date.now()}`,
-            name,
-            propertyTitle: property_title,
-            viewCount:     view_count,
-            leadScore:     lead_score,
-            isHighInterest,
-            time:          new Date(),
-          }, ...prev.slice(0, MAX_FEED - 1)])
+          // Add to live feed — replace the initial-load entry for this lead if present
+          setLiveActivities(prev => {
+            const withoutStale = prev.filter(a => a.id !== `init-${id}`)
+            return [{
+              id:            `${id}-${Date.now()}`,
+              name,
+              propertyTitle: property_title,
+              viewCount:     view_count,
+              leadScore:     lead_score,
+              isHighInterest,
+              time:          new Date(),
+            }, ...withoutStale.slice(0, MAX_FEED - 1)]
+          })
 
           // Trigger AOS alert + AI message generation for high-interest events
           if (isHighInterest && !dismissedLeadsRef.current.has(id)) {
@@ -184,7 +243,12 @@ export default function LoftyDashboard() {
               )
             }
           }
-        })
+        }
+
+        // Listen for both inserts (NEW_lead) and updates (UPDATE_lead)
+        // First-time clicks/likes insert a new row → NEW_lead; subsequent ones update → UPDATE_lead
+        insforge.realtime.on('NEW_lead', handleLeadEvent)
+        insforge.realtime.on('UPDATE_lead', handleLeadEvent)
       } catch {
         // Realtime unavailable — dashboard still works without live feed
       }
