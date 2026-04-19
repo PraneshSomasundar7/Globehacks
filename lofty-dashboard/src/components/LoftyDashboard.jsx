@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { Mail, ChevronDown, CheckCircle2, MessageSquare } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import Navbar from './Navbar'
 import AOSActionZone from './AOSActionZone'
@@ -58,8 +59,16 @@ export default function LoftyDashboard() {
   const [newUpdateId, setNewUpdateId]         = useState(null)
   const [flashingWidgets, setFlashingWidgets] = useState(new Set())
 
+  // Tracks the id of the AI-generated task currently shown in Today's Tasks
+  const [aiTaskId, setAiTaskId]               = useState('kristin-watson-task')
+
   // Live feed — only events for THIS agent's properties
   const [liveActivities, setLiveActivities] = useState([])
+
+  // Agent messages panel: sent messages + buyer acceptances
+  const [agentMessages, setAgentMessages]   = useState([])   // sent by this agent
+  const [buyerReplies, setBuyerReplies]     = useState([])   // is_acceptance=true to this agent
+  const [msgPanelOpen, setMsgPanelOpen]     = useState(true)
 
   // AI alert state
   const [liveAlert, setLiveAlert]           = useState(null)
@@ -149,21 +158,56 @@ export default function LoftyDashboard() {
       // Auto-surface AOS alert for the most recent high-interest lead
       const topLead = leads.find(l => (l.view_count || 0) >= 3 || (l.lead_score || 0) >= 70)
       if (topLead && !dismissedLeadsRef.current.has(`init-${topLead.id}`)) {
-        const alertId = `init-${topLead.id}`
+        const alertId  = `init-${topLead.id}`
+        const taskId   = `ai-task-${topLead.id}`
+        const leadName = topLead.name || 'Unknown User'
+        const propTitle = topLead.property_title || 'Unknown Property'
+
         setLiveAlert({
           leadId:        alertId,
-          leadName:      topLead.name           || 'Unknown User',
-          leadEmail:     topLead.email          || '',
-          propertyTitle: topLead.property_title || 'Unknown Property',
-          leadScore:     topLead.lead_score     || 0,
-          viewCount:     topLead.view_count     || 0,
+          leadName,
+          leadEmail:     topLead.email || '',
+          propertyTitle: propTitle,
+          leadScore:     topLead.lead_score  || 0,
+          viewCount:     topLead.view_count  || 0,
           aiMessage:     null,
         })
+
+        // Update Today's Tasks AI item to reflect the real buyer's name
+        setAiTaskId(taskId)
+        setWidgetColumns(prev =>
+          prev.map(col =>
+            col.map(widget => {
+              if (widget.title === "Today's Tasks") {
+                return {
+                  ...widget,
+                  items: widget.items.map(item =>
+                    item.isAiTask
+                      ? { ...item, id: taskId, text: `Reach out to ${leadName} — viewed ${propTitle} ${topLead.view_count || 3}×` }
+                      : item
+                  ),
+                }
+              }
+              if (widget.title === 'New Updates') {
+                return {
+                  ...widget,
+                  items: widget.items.map(item =>
+                    item.id === 'upd-1'
+                      ? { ...item, text: `${leadName} opened your email` }
+                      : item
+                  ),
+                }
+              }
+              return widget
+            })
+          )
+        )
+
         const aiMsg = await generateAIMessage({
-          leadName:      topLead.name           || 'Unknown User',
-          propertyTitle: topLead.property_title || 'Unknown Property',
+          leadName,
+          propertyTitle: propTitle,
           agentFirstName,
-          viewCount:     topLead.view_count     || 0,
+          viewCount:     topLead.view_count || 0,
         })
         if (!cancelled) {
           setLiveAlert(prev => prev?.leadId === alertId ? { ...prev, aiMessage: aiMsg } : prev)
@@ -215,6 +259,39 @@ export default function LoftyDashboard() {
               time:          new Date(),
             }, ...withoutStale.slice(0, MAX_FEED - 1)]
           })
+
+          // Keep Today's Tasks and New Updates in sync with the real buyer's name
+          if (isHighInterest) {
+            const taskId = `ai-task-${id}`
+            setAiTaskId(taskId)
+            setWidgetColumns(prev =>
+              prev.map(col =>
+                col.map(widget => {
+                  if (widget.title === "Today's Tasks") {
+                    return {
+                      ...widget,
+                      items: widget.items.map(item =>
+                        item.isAiTask
+                          ? { ...item, id: taskId, text: `Reach out to ${name} — viewed ${property_title} ${view_count}×` }
+                          : item
+                      ),
+                    }
+                  }
+                  if (widget.title === 'New Updates') {
+                    return {
+                      ...widget,
+                      items: widget.items.map(item =>
+                        item.id === 'upd-1'
+                          ? { ...item, text: `${name} opened your email`, time: 'Just now' }
+                          : item
+                      ),
+                    }
+                  }
+                  return widget
+                })
+              )
+            )
+          }
 
           // Trigger AOS alert + AI message generation for high-interest events
           if (isHighInterest && !dismissedLeadsRef.current.has(id)) {
@@ -268,9 +345,69 @@ export default function LoftyDashboard() {
     setLiveAlert(null)
   }, [])
 
+  // ── Poll agent inbox: sent messages + buyer acceptances ───────────────────
+  const lastAcceptedMsgIdRef = useRef(null)
+  useEffect(() => {
+    if (!agentEmail) return
+    let active = true
+
+    async function fetchAgentInbox() {
+      try {
+        // Sent messages (from this agent to buyers)
+        const { data: sent } = await insforge.database
+          .from('messages')
+          .select('*')
+          .eq('from_email', agentEmail)
+          .order('created_at', { ascending: false })
+          .limit(50)
+        if (active && sent) setAgentMessages(sent)
+
+        // Buyer acceptance replies (to this agent)
+        const { data: repliesRaw } = await insforge.database
+          .from('messages')
+          .select('*')
+          .eq('to_email', agentEmail)
+          .order('created_at', { ascending: false })
+          .limit(50)
+          
+        const replies = repliesRaw ? repliesRaw.filter(m => m.from_email !== agentEmail) : []
+        if (active) setBuyerReplies(replies)
+
+        // Surface new acceptances in New Updates widget
+        if (replies?.length) {
+          const newest = replies[0]
+          if (newest.id !== lastAcceptedMsgIdRef.current) {
+            lastAcceptedMsgIdRef.current = newest.id
+            const buyerFirstName = newest.from_name?.split(' ')[0] || 'The buyer'
+            const updateText = `🎉 ${buyerFirstName} accepted your showing invite${newest.property_title ? ` for ${newest.property_title}` : ''}`
+            const updateId = `accept-${newest.id}`
+            setWidgetColumns(prev =>
+              prev.map(col =>
+                col.map(widget =>
+                  widget.title === 'New Updates'
+                    ? { ...widget, items: [{ id: updateId, text: updateText, time: 'Just now', type: 'ai_resolved' }, ...widget.items.filter(i => i.id !== updateId)] }
+                    : widget
+                )
+              )
+            )
+            setNewUpdateId(updateId)
+            setFlashingWidgets(new Set(['New Updates']))
+            setTimeout(() => { setFlashingWidgets(new Set()); setNewUpdateId(null) }, 2500)
+          }
+        }
+      } catch { /* silent */ }
+    }
+
+    fetchAgentInbox()
+    const interval = setInterval(fetchAgentInbox, 4000)
+    return () => { active = false; clearInterval(interval) }
+  }, [agentEmail])
+
   // ── Ripple cascade ────────────────────────────────────────────────────────
   const handleActionComplete = useCallback(async (aiMessage) => {
-    setRemovingItemId('kristin-watson-task')
+    // Use the current AI task id (dynamic based on which lead triggered the alert)
+    const currentTaskId = aiTaskId || 'kristin-watson-task'
+    setRemovingItemId(currentTaskId)
     setTimeout(() => setFlashingWidgets(new Set(["Today's Tasks"])), 200)
 
     setTimeout(() => {
@@ -279,7 +416,7 @@ export default function LoftyDashboard() {
         for (let c = 0; c < prev.length; c++)
           for (let w = 0; w < prev[c].length; w++)
             next[c][w].icon = prev[c][w].icon
-        next[0][0].items = next[0][0].items.filter(i => i.id !== 'kristin-watson-task')
+        next[0][0].items = next[0][0].items.filter(i => i.id !== currentTaskId)
         return next
       })
       setRemovingItemId(null)
@@ -308,18 +445,21 @@ export default function LoftyDashboard() {
 
     // Deliver message to buyer via messages table (triggers realtime to UserPortal)
     const alert = liveAlertRef.current
-    if (alert?.leadEmail && aiMessage) {
+    if (alert && aiMessage) {
       try {
-        await insforge.database.from('messages').insert([{
+        const { error } = await insforge.database.from('messages').insert([{
           from_email:     agentEmail,
           from_name:      agentFullName,
-          to_email:       alert.leadEmail,
+          to_email:       alert.leadEmail || 'buyer@example.com',
           content:        aiMessage,
           property_title: alert.propertyTitle,
         }])
-      } catch { /* silent fail — UI already shows success */ }
+        if (error) console.error("Message deliver error:", error)
+      } catch (err) {
+        console.error("Message insert exception:", err)
+      }
     }
-  }, [handleAlertDismiss, agentEmail, agentFullName])
+  }, [handleAlertDismiss, agentEmail, agentFullName, aiTaskId])
 
   return (
     <div className="min-h-screen" style={{ background: '#F8F9FB' }}>
@@ -331,6 +471,104 @@ export default function LoftyDashboard() {
           liveAlert={liveAlert}
           onAlertDismiss={handleAlertDismiss}
         />
+
+        {/* ── Agent Messages Panel ── */}
+        {(agentMessages.length > 0 || buyerReplies.length > 0) && (
+          <div className="mb-5 rounded-2xl overflow-hidden"
+            style={{ background: 'white', border: '1px solid #E5E7EB', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}>
+
+            {/* Header / toggle */}
+            <button
+              onClick={() => setMsgPanelOpen(o => !o)}
+              className="w-full flex items-center justify-between px-5 py-3.5 bg-transparent border-none cursor-pointer"
+              style={{ borderBottom: msgPanelOpen ? '1px solid #F1F5F9' : 'none' }}>
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl flex items-center justify-center"
+                  style={{ background: 'linear-gradient(135deg, #EFF6FF, #DBEAFE)' }}>
+                  <Mail size={15} color="#3B82F6" />
+                </div>
+                <div className="text-left">
+                  <p className="text-sm font-semibold text-gray-800">Messages</p>
+                  <p className="text-xs text-gray-400">
+                    {agentMessages.length} sent · {buyerReplies.length} response{buyerReplies.length !== 1 ? 's' : ''}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                {buyerReplies.length > 0 && (
+                  <span className="text-xs font-semibold px-2.5 py-1 rounded-lg"
+                    style={{ background: '#F0FDF4', color: '#16A34A', border: '1px solid #BBF7D0' }}>
+                    {buyerReplies.length} accepted ✓
+                  </span>
+                )}
+                <ChevronDown size={16} color="#94A3B8"
+                  style={{ transform: msgPanelOpen ? 'rotate(180deg)' : 'rotate(0deg)', transition: 'transform 0.2s' }} />
+              </div>
+            </button>
+
+            {msgPanelOpen && (
+              <div className="divide-y divide-gray-50 max-h-80 overflow-y-auto">
+
+                {/* Buyer acceptances first */}
+                {buyerReplies.map(reply => (
+                  <div key={reply.id} className="flex items-start gap-3 px-5 py-3.5"
+                    style={{ background: 'linear-gradient(135deg, #F0FDF4, #ECFDF5)' }}>
+                    <div className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 text-xs font-bold text-white"
+                      style={{ background: 'linear-gradient(135deg, #10B981, #059669)' }}>
+                      {reply.from_name?.split(' ').map(n => n[0]).join('').slice(0,2) || 'B'}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <p className="text-xs font-bold text-gray-800">{reply.from_name || 'Buyer'}</p>
+                        <span className="text-xs font-semibold px-1.5 py-0.5 rounded-md"
+                          style={{ background: '#D1FAE5', color: '#065F46' }}>✓ Accepted</span>
+                      </div>
+                      {reply.property_title && (
+                        <p className="text-xs text-gray-400 mb-1">Re: {reply.property_title}</p>
+                      )}
+                      <p className="text-xs text-gray-600 leading-relaxed bg-white px-3 py-2 rounded-lg border"
+                        style={{ borderColor: '#D1FAE5' }}>
+                        "{reply.content}"
+                      </p>
+                    </div>
+                    <span className="text-xs text-gray-400 shrink-0">
+                      {reply.created_at ? new Date(reply.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now'}
+                    </span>
+                  </div>
+                ))}
+
+                {/* Sent messages */}
+                {agentMessages.map(msg => {
+                  const hasReply = buyerReplies.some(r => r.property_title === msg.property_title && r.from_email === msg.to_email)
+                  return (
+                    <div key={msg.id} className="flex items-start gap-3 px-5 py-3.5">
+                      <div className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0"
+                        style={{ background: hasReply ? '#F0FDF4' : '#EFF6FF', border: `1px solid ${hasReply ? '#A7F3D0' : '#BFDBFE'}` }}>
+                        <MessageSquare size={14} color={hasReply ? '#059669' : '#3B82F6'} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <p className="text-xs font-semibold text-gray-700 truncate">To: {msg.to_email}</p>
+                          <span className="text-xs font-semibold px-1.5 py-0.5 rounded-md shrink-0"
+                            style={{ background: hasReply ? '#D1FAE5' : '#EFF6FF', color: hasReply ? '#065F46' : '#1D4ED8' }}>
+                            {hasReply ? '✓ Accepted' : '· Pending'}
+                          </span>
+                        </div>
+                        {msg.property_title && (
+                          <p className="text-xs text-gray-400 mb-1">Re: {msg.property_title}</p>
+                        )}
+                        <p className="text-xs text-gray-600 leading-relaxed truncate">"{msg.content}"</p>
+                      </div>
+                      <span className="text-xs text-gray-400 shrink-0">
+                        {msg.created_at ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Sent'}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         <LiveActivityFeed activities={liveActivities} />
 

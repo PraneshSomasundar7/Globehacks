@@ -5,17 +5,17 @@ import {
   Home, Search, Bell, LogOut, MapPin, Bed, Bath, Maximize,
   Heart, Eye, Sparkles, Send, SlidersHorizontal,
   X, CheckCircle2, Bot, Loader2, UserCircle, MessageSquare,
-  TrendingUp, Activity,
+  TrendingUp, Activity, Mail, ChevronDown,
 } from 'lucide-react'
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const TAGS = [
-  { label: 'Just Listed',  color: '#3B82F6' },
-  { label: 'Open House',   color: '#10B981' },
-  { label: 'Coming Soon',  color: '#F59E0B' },
-  { label: 'New',          color: '#06B6D4' },
-  { label: 'Price Drop',   color: '#EF4444' },
+  { label: 'Just Listed', color: '#3B82F6' },
+  { label: 'Open House', color: '#10B981' },
+  { label: 'Coming Soon', color: '#F59E0B' },
+  { label: 'New', color: '#06B6D4' },
+  { label: 'Price Drop', color: '#EF4444' },
 ]
 
 function getTag(property, idx) {
@@ -29,9 +29,9 @@ function formatPrice(price) {
 }
 
 function parseSpecs(specs = '') {
-  const bed  = specs.match(/(\d+(?:\.\d+)?)\s*bed/i)?.[1]  ?? '—'
+  const bed = specs.match(/(\d+(?:\.\d+)?)\s*bed/i)?.[1] ?? '—'
   const bath = specs.match(/(\d+(?:\.\d+)?)\s*bath/i)?.[1] ?? '—'
-  const sqft = specs.match(/([\d,]+)\s*sqft/i)?.[1]        ?? '—'
+  const sqft = specs.match(/([\d,]+)\s*sqft/i)?.[1] ?? '—'
   return { bed, bath, sqft }
 }
 
@@ -43,7 +43,7 @@ const AGENT_COLORS = {
 
 function timeAgo(date) {
   const secs = Math.floor((Date.now() - new Date(date)) / 1000)
-  if (secs < 60)   return 'Just now'
+  if (secs < 60) return 'Just now'
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`
   return `${Math.floor(secs / 3600)}h ago`
 }
@@ -67,7 +67,7 @@ function SkeletonCard() {
 export default function UserPortal() {
   const { user, logout } = useAuth()
 
-  const [properties, setProperties]     = useState([])
+  const [properties, setProperties] = useState([])
   const [loadingProps, setLoadingProps] = useState(true)
 
   // Per-property lead tracking: { [property_title]: { id, lead_score, view_count } }
@@ -79,22 +79,31 @@ export default function UserPortal() {
     setPropertyLeads(prev => ({ ...prev, [title]: data }))
   }, [])
 
-  const [searchQuery, setSearchQuery]         = useState('')
-  const [sortBy, setSortBy]                   = useState('Recommended')
-  const [favorites, setFavorites]             = useState(new Set())
+  const [searchQuery, setSearchQuery] = useState('')
+  const [sortBy, setSortBy] = useState('Recommended')
+  const [favorites, setFavorites] = useState(new Set())
   const [selectedListing, setSelectedListing] = useState(null)
-  const [lastLikedTitle, setLastLikedTitle]   = useState(null)
-  const [aiDismissed, setAiDismissed]         = useState(false)
-  const [aiSending, setAiSending]             = useState(false)
-  const [aiSent, setAiSent]                   = useState(false)
+  const [lastLikedTitle, setLastLikedTitle] = useState(null)
+  const [aiDismissed, setAiDismissed] = useState(false)
+  const [aiSending, setAiSending] = useState(false)
+  const [aiSent, setAiSent] = useState(false)
 
-  const [incomingMsg, setIncomingMsg]         = useState(null)
-  const [msgDismissed, setMsgDismissed]       = useState(false)
+  const [incomingMsg, setIncomingMsg] = useState(null)
+  const [msgDismissed, setMsgDismissed] = useState(false)
+  const [msgAccepted, setMsgAccepted] = useState(false)
+  const [msgAccepting, setMsgAccepting] = useState(false)
+  const lastMsgIdRef = useRef(null)
 
-  const [activeTab, setActiveTab]                       = useState('browse')
-  const [latestActivityTitle, setLatestActivityTitle]   = useState(null)
+  // All messages for this buyer (inbox)
+  const [allMessages, setAllMessages] = useState([])
+  const [acceptingMsgId, setAcceptingMsgId] = useState(null)
+  const [acceptedMsgIds, setAcceptedMsgIds] = useState(new Set())
+  const unreadCount = allMessages.filter(m => m.from_email !== user?.email && !acceptedMsgIds.has(m.id)).length
 
-  const firstName  = user?.full_name?.split(' ')[0] || 'there'
+  const [activeTab, setActiveTab] = useState('browse')
+  const [latestActivityTitle, setLatestActivityTitle] = useState(null)
+
+  const firstName = user?.full_name?.split(' ')[0] || 'there'
   const totalScore = useMemo(
     () => Object.values(propertyLeads).reduce((s, l) => s + (l.lead_score || 0), 0),
     [propertyLeads]
@@ -133,29 +142,122 @@ export default function UserPortal() {
     return () => { cancelled = true }
   }, [user])
 
-  // ── Listen for incoming messages from agent ───────────────────────────────
+  // ── Listen for incoming messages from agent (polling + realtime hybrid) ─────
   useEffect(() => {
     if (!user?.email) return
     let active = true
 
-    async function setupMessages() {
+    // Core fetch: get the latest unaccepted message addressed to this buyer
+    async function fetchLatestMessage() {
+      try {
+        const { data } = await insforge.database
+          .from('messages')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(20)
+        if (!active || !data?.length) return
+
+        // Find the newest message that isn't from the buyer and isn't accepted locally
+        const msg = data.find(m => m.from_email !== user.email && !acceptedMsgIds.has(m.id))
+        if (!msg) return
+
+        // Only surface if it's truly new (different id from what we last saw)
+        if (msg.id !== lastMsgIdRef.current) {
+          lastMsgIdRef.current = msg.id
+          setIncomingMsg(msg)
+          setMsgDismissed(false)
+          setMsgAccepted(false)
+        }
+      } catch { /* silent */ }
+    }
+
+    // Fire immediately, then poll every 3 s
+    fetchLatestMessage()
+    const interval = setInterval(fetchLatestMessage, 3000)
+
+    // Also wire up realtime as a fast-path on top
+    async function setupRealtime() {
       try {
         await insforge.realtime.connect()
         await insforge.realtime.subscribe('messages')
         insforge.realtime.on('NEW_message', (payload) => {
-          if (!active || payload.to_email !== user.email) return
+          if (!active) return
+          // Skip if it's a message we sent or if we've already accepted it
+          if (payload.from_email === user.email || acceptedMsgIds.has(payload.id)) return
+          lastMsgIdRef.current = payload.id
           setIncomingMsg(payload)
           setMsgDismissed(false)
+          setMsgAccepted(false)
         })
-      } catch { /* silent */ }
+      } catch { /* realtime unavailable — polling covers it */ }
     }
+    setupRealtime()
 
-    setupMessages()
     return () => {
       active = false
-      insforge.realtime.unsubscribe('messages')
-      insforge.realtime.disconnect()
+      clearInterval(interval)
+      try { insforge.realtime.unsubscribe('messages') } catch { }
     }
+  }, [user?.email])
+
+  // ── Accept incoming message: mark accepted + notify agent ────────────────
+  const handleAcceptMessage = useCallback(async () => {
+    if (!incomingMsg || !user) return
+    setMsgAccepting(true)
+    try {
+      await insforge.database.from('messages').insert([{
+        from_email: user.email,
+        from_name: user.full_name,
+        to_email: incomingMsg.from_email,
+        content: `Hi ${incomingMsg.from_name?.split(' ')[0] || 'there'}! I'd love to schedule a showing. Looking forward to it! — ${user.full_name?.split(' ')[0] || user.full_name}`,
+        property_title: incomingMsg.property_title,
+      }])
+      setAcceptedMsgIds(prev => new Set([...prev, incomingMsg.id]))
+    } catch { /* silent */ }
+    setMsgAccepting(false)
+    setMsgAccepted(true)
+  }, [incomingMsg, user])
+
+  // ── Per-message accept (used from inbox tab) ───────────────────────────────
+  const handleAcceptMsg = useCallback(async (msg) => {
+    if (!user || acceptingMsgId === msg.id) return
+    setAcceptingMsgId(msg.id)
+    try {
+      await insforge.database.from('messages').insert([{
+        from_email: user.email,
+        from_name: user.full_name,
+        to_email: msg.from_email,
+        content: `Hi ${msg.from_name?.split(' ')[0] || 'there'}! I'd love to schedule a showing. Looking forward to it! — ${user.full_name?.split(' ')[0] || user.full_name}`,
+        property_title: msg.property_title,
+      }])
+      setAcceptedMsgIds(prev => new Set([...prev, msg.id]))
+      // Also update allMessages to reflect accepted state immediately
+      setAllMessages(prev => prev.map(m => m.id === msg.id ? { ...m, accepted: true } : m))
+      // Keep banner in sync if this was the banner message
+      if (incomingMsg?.id === msg.id) setMsgAccepted(true)
+    } catch { /* silent */ }
+    setAcceptingMsgId(null)
+  }, [user, acceptingMsgId, incomingMsg])
+
+  // ── Fetch ALL messages for inbox tab ────────────────────────────────────
+  useEffect(() => {
+    if (!user?.email) return
+    let active = true
+    async function fetchAllMessages() {
+      try {
+        const { data } = await insforge.database
+          .from('messages')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(50)
+        if (!active || !data) return
+        // Filter out messages we sent (so inbox only shows agent->buyer messages)
+        setAllMessages(data.filter(m => m.from_email !== user.email))
+      } catch { /* silent */ }
+    }
+    fetchAllMessages()
+    const interval = setInterval(fetchAllMessages, 3000)
+    return () => { active = false; clearInterval(interval) }
   }, [user?.email])
 
   // ── Per-property interaction handler ──────────────────────────────────────
@@ -182,15 +284,15 @@ export default function UserPortal() {
       const { data: created } = await insforge.database
         .from('leads')
         .insert([{
-          name:           user.full_name,
-          email:          user.email,
+          name: user.full_name,
+          email: user.email,
           property_title: propertyTitle,
-          agent_email:    agentEmail,
-          agent_name:     agentName,
-          lead_score:     initScore,
-          view_count:     initViews,
-          status:         'active',
-          last_activity:  now,
+          agent_email: agentEmail,
+          agent_name: agentName,
+          lead_score: initScore,
+          view_count: initViews,
+          status: 'active',
+          last_activity: now,
         }])
         .select('id, lead_score, view_count')
       if (created?.[0]) updatePropertyLead(propertyTitle, { ...created[0], last_activity: now })
@@ -330,7 +432,7 @@ export default function UserPortal() {
                 className="w-full pl-11 pr-4 py-3.5 rounded-xl text-sm outline-none transition-all"
                 style={{ border: '1px solid #E2E8F0', background: 'white', color: '#1E293B', boxShadow: '0 1px 3px rgba(0,0,0,0.04)' }}
                 onFocus={e => (e.target.style.borderColor = '#3B82F6')}
-                onBlur={e  => (e.target.style.borderColor = '#E2E8F0')}
+                onBlur={e => (e.target.style.borderColor = '#E2E8F0')}
               />
             </div>
             <button className="flex items-center gap-2 px-5 py-3 rounded-xl text-sm font-medium cursor-pointer transition-all hover:bg-gray-50"
@@ -389,39 +491,111 @@ export default function UserPortal() {
           </div>
         )}
 
-        {/* ── Incoming Agent Message ── */}
+        {/* ── Incoming Agent Message Notification ── */}
         {incomingMsg && !msgDismissed && (
           <div className="rounded-2xl p-5 mb-6 relative overflow-hidden"
-            style={{ background: 'linear-gradient(135deg, #F0FDF4 0%, #ECFDF5 100%)', border: '1px solid #6EE7B7', boxShadow: '0 4px 20px rgba(16,185,129,0.15)' }}>
+            style={{
+              background: msgAccepted
+                ? 'linear-gradient(135deg, #F0FDF4 0%, #ECFDF5 100%)'
+                : 'linear-gradient(135deg, #EFF6FF 0%, #F0FDF4 100%)',
+              border: msgAccepted ? '1px solid #6EE7B7' : '1px solid #93C5FD',
+              boxShadow: msgAccepted
+                ? '0 4px 20px rgba(16,185,129,0.15)'
+                : '0 4px 20px rgba(59,130,246,0.15)',
+            }}>
             <button onClick={() => setMsgDismissed(true)}
               className="absolute top-3 right-3 w-7 h-7 rounded-lg flex items-center justify-center bg-transparent border-none cursor-pointer hover:bg-white/60">
               <X size={14} color="#94A3B8" />
             </button>
-            <div className="flex items-start gap-4">
-              <div className="w-12 h-12 rounded-2xl flex items-center justify-center shrink-0"
-                style={{ background: 'linear-gradient(135deg, #10B981, #059669)', boxShadow: '0 4px 12px rgba(16,185,129,0.35)' }}>
-                <MessageSquare size={22} color="white" />
+
+            {/* Header */}
+            <div className="flex items-center gap-2 mb-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+                style={{
+                  background: msgAccepted
+                    ? 'linear-gradient(135deg, #10B981, #059669)'
+                    : 'linear-gradient(135deg, #3B82F6, #1D4ED8)',
+                  boxShadow: msgAccepted
+                    ? '0 3px 10px rgba(16,185,129,0.35)'
+                    : '0 3px 10px rgba(59,130,246,0.35)',
+                }}>
+                {msgAccepted
+                  ? <CheckCircle2 size={20} color="white" />
+                  : <MessageSquare size={20} color="white" />}
               </div>
               <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  <p className="text-sm font-bold text-gray-800">Message from {incomingMsg.from_name}</p>
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full"
-                    style={{ background: '#D1FAE5', color: '#065F46', border: '1px solid #6EE7B7' }}>
-                    Your Agent
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="text-sm font-bold text-gray-800">
+                    {msgAccepted ? '✅ Showing Accepted!' : `📩 New message from ${incomingMsg.from_name || 'Your Agent'}`}
+                  </p>
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded-full flex items-center gap-1"
+                    style={{
+                      background: msgAccepted ? '#D1FAE5' : '#DBEAFE',
+                      color: msgAccepted ? '#065F46' : '#1D4ED8',
+                      border: msgAccepted ? '1px solid #6EE7B7' : '1px solid #93C5FD',
+                    }}>
+                    <Sparkles size={9} />
+                    {msgAccepted ? 'Response Sent' : 'Your Agent'}
                   </span>
-                  <span className="text-xs text-gray-400">Just now</span>
                 </div>
                 {incomingMsg.property_title && (
-                  <p className="text-xs text-gray-400 mb-1.5 flex items-center gap-1">
-                    <Home size={11} /> Re: {incomingMsg.property_title}
+                  <p className="text-xs text-gray-400 mt-0.5 flex items-center gap-1">
+                    <Home size={10} /> Re: {incomingMsg.property_title}
                   </p>
                 )}
-                <p className="text-sm text-gray-700 leading-relaxed p-3 rounded-xl"
-                  style={{ background: 'white', border: '1px solid #D1FAE5' }}>
-                  "{incomingMsg.content}"
-                </p>
               </div>
             </div>
+
+            {/* Message bubble */}
+            <div className="rounded-xl p-4 mb-4"
+              style={{
+                background: 'white',
+                border: `1px solid ${msgAccepted ? '#A7F3D0' : '#BFDBFE'}`,
+                boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
+              }}>
+              <p className="text-xs font-semibold mb-1.5 flex items-center gap-1.5"
+                style={{ color: msgAccepted ? '#059669' : '#2563EB' }}>
+                <MessageSquare size={11} />
+                {msgAccepted ? 'Agent\'s message' : 'Message from your agent'}
+              </p>
+              <p className="text-sm text-gray-700 leading-relaxed">
+                "{incomingMsg.content}"
+              </p>
+            </div>
+
+            {/* Action area */}
+            {msgAccepted ? (
+              <div className="flex items-center gap-2">
+                <CheckCircle2 size={16} color="#10B981" />
+                <p className="text-sm text-gray-600">
+                  Your agent <strong>{incomingMsg.from_name}</strong> has been notified. They'll reach out to confirm the time.
+                </p>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2.5">
+                <button
+                  onClick={handleAcceptMessage}
+                  disabled={msgAccepting}
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white border-none cursor-pointer disabled:opacity-70 disabled:cursor-not-allowed"
+                  style={{
+                    background: msgAccepting ? '#059669' : 'linear-gradient(135deg, #10B981, #059669)',
+                    boxShadow: '0 2px 8px rgba(16,185,129,0.4)',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  {msgAccepting
+                    ? <><Loader2 size={14} className="animate-spin" /> Accepting..{'>'}</>
+                    : <><CheckCircle2 size={14} /> Accept Showing</>}
+                </button>
+                <button
+                  onClick={() => setMsgDismissed(true)}
+                  className="px-4 py-2.5 rounded-xl text-sm font-medium bg-transparent border-none cursor-pointer"
+                  style={{ color: '#94A3B8' }}
+                >
+                  Maybe later
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -452,7 +626,151 @@ export default function UserPortal() {
               </span>
             )}
           </button>
+          <button onClick={() => setActiveTab('messages')}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border-none cursor-pointer transition-all"
+            style={{
+              background: activeTab === 'messages' ? 'white' : 'transparent',
+              color: activeTab === 'messages' ? '#1E293B' : '#64748B',
+              boxShadow: activeTab === 'messages' ? '0 1px 4px rgba(0,0,0,0.08)' : 'none',
+            }}>
+            <Mail size={14} /> Messages
+            {unreadCount > 0 && (
+              <span className="flex items-center justify-center w-5 h-5 rounded-full text-xs font-bold text-white"
+                style={{ background: '#EF4444' }}>
+                {unreadCount}
+              </span>
+            )}
+          </button>
         </div>
+
+        {/* ── Messages Tab ── */}
+        {activeTab === 'messages' && (
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-bold text-gray-800">Messages</h2>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {allMessages.length === 0 ? 'No messages yet' : `${allMessages.length} message${allMessages.length !== 1 ? 's' : ''} from your agent`}
+                </p>
+              </div>
+              {unreadCount > 0 && (
+                <span className="text-xs font-semibold px-3 py-1.5 rounded-xl"
+                  style={{ background: '#FEF2F2', color: '#DC2626', border: '1px solid #FECACA' }}>
+                  {unreadCount} unread
+                </span>
+              )}
+            </div>
+
+            {allMessages.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-20 rounded-2xl"
+                style={{ background: 'white', border: '1px solid #F1F3F5' }}>
+                <div className="w-14 h-14 rounded-2xl flex items-center justify-center mb-3"
+                  style={{ background: 'linear-gradient(135deg, #EFF6FF, #DBEAFE)' }}>
+                  <Mail size={28} color="#3B82F6" />
+                </div>
+                <p className="text-sm font-semibold text-gray-600">No messages yet</p>
+                <p className="text-xs text-gray-400 mt-1 text-center max-w-xs">
+                  When your agent sends you a message, it will appear here.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                {allMessages.map(msg => {
+                  const isAccepted = acceptedMsgIds.has(msg.id)
+                  const isAccepting = acceptingMsgId === msg.id
+                  return (
+                    <div key={msg.id}
+                      className="rounded-2xl p-5 transition-shadow hover:shadow-md"
+                      style={{
+                        background: isAccepted
+                          ? 'linear-gradient(135deg, #F0FDF4, #ECFDF5)'
+                          : 'white',
+                        border: isAccepted ? '1px solid #A7F3D0' : '1px solid #E5E7EB',
+                        boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
+                      }}>
+
+                      {/* Message header */}
+                      <div className="flex items-start justify-between gap-3 mb-3">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 text-sm font-bold text-white"
+                            style={{ background: isAccepted ? 'linear-gradient(135deg,#10B981,#059669)' : 'linear-gradient(135deg,#3B82F6,#1D4ED8)' }}>
+                            {msg.from_name?.split(' ').map(n => n[0]).join('').slice(0, 2) || 'AG'}
+                          </div>
+                          <div>
+                            <p className="text-sm font-bold text-gray-800">{msg.from_name || 'Your Agent'}</p>
+                            <p className="text-xs text-gray-400">Your Agent</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {isAccepted ? (
+                            <span className="flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full"
+                              style={{ background: '#D1FAE5', color: '#065F46', border: '1px solid #6EE7B7' }}>
+                              <CheckCircle2 size={11} /> Accepted
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full"
+                              style={{ background: '#EFF6FF', color: '#1D4ED8', border: '1px solid #BFDBFE' }}>
+                              <Mail size={11} /> New
+                            </span>
+                          )}
+                          {msg.created_at && (
+                            <span className="text-xs text-gray-400">{timeAgo(msg.created_at)}</span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Property tag */}
+                      {msg.property_title && (
+                        <div className="flex items-center gap-1.5 mb-3">
+                          <Home size={12} color="#94A3B8" />
+                          <span className="text-xs font-medium text-gray-500">Re: {msg.property_title}</span>
+                        </div>
+                      )}
+
+                      {/* Message content bubble */}
+                      <div className="rounded-xl p-4 mb-4"
+                        style={{
+                          background: isAccepted ? 'rgba(255,255,255,0.7)' : '#F8FAFC',
+                          border: isAccepted ? '1px solid #D1FAE5' : '1px solid #E2E8F0',
+                        }}>
+                        <p className="text-xs font-semibold mb-2 flex items-center gap-1.5"
+                          style={{ color: isAccepted ? '#059669' : '#64748B' }}>
+                          <MessageSquare size={11} /> Message
+                        </p>
+                        <p className="text-sm text-gray-700 leading-relaxed">
+                          "{msg.content}"
+                        </p>
+                      </div>
+
+                      {/* Action */}
+                      {!isAccepted && (
+                        <button
+                          onClick={() => handleAcceptMsg(msg)}
+                          disabled={isAccepting}
+                          className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white border-none cursor-pointer disabled:opacity-70 disabled:cursor-not-allowed"
+                          style={{
+                            background: 'linear-gradient(135deg, #10B981, #059669)',
+                            boxShadow: '0 2px 8px rgba(16,185,129,0.35)',
+                          }}
+                        >
+                          {isAccepting
+                            ? <><Loader2 size={14} className="animate-spin" /> Accepting...</>
+                            : <><CheckCircle2 size={14} /> Accept Showing</>}
+                        </button>
+                      )}
+                      {isAccepted && (
+                        <p className="text-xs text-emerald-600 flex items-center gap-1.5 font-medium">
+                          <CheckCircle2 size={13} color="#059669" />
+                          You accepted this showing — your agent has been notified.
+                        </p>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* ── Browse Tab ── */}
         {activeTab === 'browse' && (
@@ -481,69 +799,69 @@ export default function UserPortal() {
               {loadingProps
                 ? Array.from({ length: 6 }).map((_, i) => <SkeletonCard key={i} />)
                 : displayedProperties.map((listing, idx) => {
-                    const { bed, bath, sqft } = parseSpecs(listing.specs)
-                    const tag        = getTag(listing, idx)
-                    const liked      = favorites.has(listing.id)
-                    const leadData   = propertyLeads[listing.title]
-                    const viewCount  = leadData?.view_count ?? 0
-                    const agentColor = AGENT_COLORS[listing.agent_email] || { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' }
-                    return (
-                      <div key={listing.id}
-                        className="rounded-2xl overflow-hidden cursor-pointer group"
-                        style={{
-                          background: 'white', border: '1px solid #F1F3F5',
-                          boxShadow: '0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.02)',
-                          transition: 'transform 0.2s ease, box-shadow 0.2s ease',
-                        }}
-                        onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-3px)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.10)' }}
-                        onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.02)' }}
-                        onClick={() => handleCardClick(listing)}
-                      >
-                        <div className="relative h-48 overflow-hidden">
-                          <img src={listing.image_url} alt={listing.title}
-                            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" loading="lazy" />
-                          <div className="absolute inset-0" style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.32) 0%, transparent 55%)' }} />
-                          <span className="absolute top-3 left-3 text-xs font-bold px-2.5 py-1 rounded-lg text-white"
-                            style={{ background: tag.color, boxShadow: '0 2px 6px rgba(0,0,0,0.15)' }}>{tag.label}</span>
-                          <button onClick={e => toggleFavorite(listing.id, listing, e)}
-                            className="absolute top-3 right-3 w-9 h-9 rounded-xl flex items-center justify-center bg-white/80 backdrop-blur border-none cursor-pointer"
-                            style={{ transition: 'transform 0.15s ease' }}
-                            onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.15)'; e.currentTarget.style.background = 'white' }}
-                            onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.background = 'rgba(255,255,255,0.8)' }}>
-                            <Heart size={18} color={liked ? '#EF4444' : '#94A3B8'} fill={liked ? '#EF4444' : 'none'}
-                              style={{ transition: 'color 0.2s, fill 0.2s' }} />
-                          </button>
-                          <div className="absolute bottom-3 left-3">
-                            <p className="text-xl font-bold text-white" style={{ textShadow: '0 1px 4px rgba(0,0,0,0.3)' }}>
-                              {formatPrice(listing.price)}
-                            </p>
-                          </div>
-                          {viewCount > 0 && (
-                            <div className="absolute bottom-3 right-3 flex items-center gap-1 px-2 py-1 rounded-lg text-white text-xs font-semibold"
-                              style={{ background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)' }}>
-                              <Eye size={11} /> {viewCount}
-                            </div>
-                          )}
+                  const { bed, bath, sqft } = parseSpecs(listing.specs)
+                  const tag = getTag(listing, idx)
+                  const liked = favorites.has(listing.id)
+                  const leadData = propertyLeads[listing.title]
+                  const viewCount = leadData?.view_count ?? 0
+                  const agentColor = AGENT_COLORS[listing.agent_email] || { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' }
+                  return (
+                    <div key={listing.id}
+                      className="rounded-2xl overflow-hidden cursor-pointer group"
+                      style={{
+                        background: 'white', border: '1px solid #F1F3F5',
+                        boxShadow: '0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.02)',
+                        transition: 'transform 0.2s ease, box-shadow 0.2s ease',
+                      }}
+                      onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-3px)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.10)' }}
+                      onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.02)' }}
+                      onClick={() => handleCardClick(listing)}
+                    >
+                      <div className="relative h-48 overflow-hidden">
+                        <img src={listing.image_url} alt={listing.title}
+                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" loading="lazy" />
+                        <div className="absolute inset-0" style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.32) 0%, transparent 55%)' }} />
+                        <span className="absolute top-3 left-3 text-xs font-bold px-2.5 py-1 rounded-lg text-white"
+                          style={{ background: tag.color, boxShadow: '0 2px 6px rgba(0,0,0,0.15)' }}>{tag.label}</span>
+                        <button onClick={e => toggleFavorite(listing.id, listing, e)}
+                          className="absolute top-3 right-3 w-9 h-9 rounded-xl flex items-center justify-center bg-white/80 backdrop-blur border-none cursor-pointer"
+                          style={{ transition: 'transform 0.15s ease' }}
+                          onMouseEnter={e => { e.currentTarget.style.transform = 'scale(1.15)'; e.currentTarget.style.background = 'white' }}
+                          onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.background = 'rgba(255,255,255,0.8)' }}>
+                          <Heart size={18} color={liked ? '#EF4444' : '#94A3B8'} fill={liked ? '#EF4444' : 'none'}
+                            style={{ transition: 'color 0.2s, fill 0.2s' }} />
+                        </button>
+                        <div className="absolute bottom-3 left-3">
+                          <p className="text-xl font-bold text-white" style={{ textShadow: '0 1px 4px rgba(0,0,0,0.3)' }}>
+                            {formatPrice(listing.price)}
+                          </p>
                         </div>
-                        <div className="p-4">
-                          <p className="text-sm font-semibold text-gray-800 truncate">{listing.title}</p>
-                          <p className="text-xs text-gray-400 mt-0.5 flex items-center gap-1"><MapPin size={11} /> {listing.location}</p>
-                          {listing.agent_name && (
-                            <div className="mt-2 flex items-center gap-1.5 w-fit px-2.5 py-1 rounded-lg"
-                              style={{ background: agentColor.bg, border: `1px solid ${agentColor.border}` }}>
-                              <UserCircle size={12} color={agentColor.text} />
-                              <span className="text-xs font-medium" style={{ color: agentColor.text }}>{listing.agent_name}</span>
-                            </div>
-                          )}
-                          <div className="flex items-center gap-4 mt-3 pt-3" style={{ borderTop: '1px solid #F1F3F5' }}>
-                            <span className="text-xs text-gray-500 flex items-center gap-1"><Bed size={13} color="#94A3B8" /> {bed} Beds</span>
-                            <span className="text-xs text-gray-500 flex items-center gap-1"><Bath size={13} color="#94A3B8" /> {bath} Baths</span>
-                            <span className="text-xs text-gray-500 flex items-center gap-1"><Maximize size={13} color="#94A3B8" /> {sqft} sqft</span>
+                        {viewCount > 0 && (
+                          <div className="absolute bottom-3 right-3 flex items-center gap-1 px-2 py-1 rounded-lg text-white text-xs font-semibold"
+                            style={{ background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)' }}>
+                            <Eye size={11} /> {viewCount}
                           </div>
+                        )}
+                      </div>
+                      <div className="p-4">
+                        <p className="text-sm font-semibold text-gray-800 truncate">{listing.title}</p>
+                        <p className="text-xs text-gray-400 mt-0.5 flex items-center gap-1"><MapPin size={11} /> {listing.location}</p>
+                        {listing.agent_name && (
+                          <div className="mt-2 flex items-center gap-1.5 w-fit px-2.5 py-1 rounded-lg"
+                            style={{ background: agentColor.bg, border: `1px solid ${agentColor.border}` }}>
+                            <UserCircle size={12} color={agentColor.text} />
+                            <span className="text-xs font-medium" style={{ color: agentColor.text }}>{listing.agent_name}</span>
+                          </div>
+                        )}
+                        <div className="flex items-center gap-4 mt-3 pt-3" style={{ borderTop: '1px solid #F1F3F5' }}>
+                          <span className="text-xs text-gray-500 flex items-center gap-1"><Bed size={13} color="#94A3B8" /> {bed} Beds</span>
+                          <span className="text-xs text-gray-500 flex items-center gap-1"><Bath size={13} color="#94A3B8" /> {bath} Baths</span>
+                          <span className="text-xs text-gray-500 flex items-center gap-1"><Maximize size={13} color="#94A3B8" /> {sqft} sqft</span>
                         </div>
                       </div>
-                    )
-                  })
+                    </div>
+                  )
+                })
               }
             </div>
 
@@ -580,8 +898,8 @@ export default function UserPortal() {
             ) : (
               <div className="flex flex-col gap-3">
                 {activityList.map(item => {
-                  const agentColor     = AGENT_COLORS[item.property.agent_email] || { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' }
-                  const isNew          = item.propertyTitle === latestActivityTitle
+                  const agentColor = AGENT_COLORS[item.property.agent_email] || { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' }
+                  const isNew = item.propertyTitle === latestActivityTitle
                   const isHighInterest = item.view_count >= 3 || item.lead_score >= 70
                   return (
                     <div key={item.propertyTitle}
@@ -647,8 +965,8 @@ export default function UserPortal() {
         {/* ── Property Detail Modal ── */}
         {selectedListing && (() => {
           const { bed, bath, sqft } = parseSpecs(selectedListing.specs)
-          const liked    = favorites.has(selectedListing.id)
-          const myViews  = propertyLeads[selectedListing.title]?.view_count ?? 0
+          const liked = favorites.has(selectedListing.id)
+          const myViews = propertyLeads[selectedListing.title]?.view_count ?? 0
           const agentColor = AGENT_COLORS[selectedListing.agent_email] || { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' }
           return (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4"
